@@ -7,6 +7,11 @@ from tqdm import tqdm
 import cv2
 import json
 
+import rasterio.features
+import shapely
+import geopandas as gpd
+from collections import defaultdict
+
 #Helper functions
 def to_tensor_x(x, **kwargs):
     return x.transpose(2, 0, 1).astype('float32')
@@ -126,6 +131,66 @@ def slide_process_single(model, tis_det_map_mpp, slide, patch_n_w_l0, patch_n_h_
     return end_image_1class, end_image
 
 
+def diff_polys(positive_polygon, intersecting_neg_polys):
+    """Subtract negative polygons from positive polygon."""
+    if intersecting_neg_polys:                    
+        # Unify negative polygons first for better performance
+        big_neg_poly = shapely.ops.unary_union(intersecting_neg_polys)    
+        positive_polygon = positive_polygon.difference(big_neg_poly)
+    return positive_polygon
+
+def mask_to_polygons(mask):
+    """
+    Convert binary mask to polygons
+    
+    Args:
+        mask: Binary numpy array with foreground as True
+        
+    Returns:
+        List of Shapely polygons
+    """
+    
+    # Extract shapes
+    shapes_gen = rasterio.features.shapes(np.int16(mask))
+    
+    # Separate positive and negative polygons
+    positive_polys = []
+    negative_polys = []    
+    for shape_data, value in shapes_gen:
+        poly = shapely.geometry.shape(shape_data)
+        if value:  # Foreground
+            positive_polys.append(poly)
+        elif not value:  # Background holes
+            negative_polys.append(poly)
+    
+    # Early exit if no positive polygons
+    if not positive_polys:
+        return []
+    
+    # Hole-polygon mapping using spatial indexing
+    if negative_polys:
+        # Group negative polygons by which positive polygons they intersect
+        poly_holes_map = defaultdict(list)
+        
+        for neg_poly in negative_polys:
+            for i, pos_poly in enumerate(positive_polys):
+                if pos_poly.intersects(neg_poly):
+                    poly_holes_map[i].append(neg_poly)
+        
+        # Apply differences
+        result_polys = []
+        for i, pos_poly in enumerate(positive_polys):
+            if i in poly_holes_map:
+                result_poly = diff_polys(pos_poly, poly_holes_map[i])
+            else:
+                result_poly = pos_poly
+            result_polys.append(result_poly)
+    else:
+        result_polys = positive_polys
+    
+    return result_polys
+
+
 def mask_to_geojson(mask_path, output_path, scale_factor=1.0):
     """
     Convert a semantic segmentation mask to GeoJSON with coordinate scaling
@@ -162,58 +227,22 @@ def mask_to_geojson(mask_path, output_path, scale_factor=1.0):
 
     # Iterate through unique class values (1 to 7)
     for class_value in range(2, 7):
-        # Create a binary mask for the current class
-        class_mask = (mask == class_value).astype(np.uint8) * 255
+        # Create a binary mask for the current class and extract polygons
+        class_mask = mask == class_value
+        polygons = mask_to_polygons(class_mask)                
+        features.extend([{'class_id': class_value,'classification':CLASS_MAPPING.get(class_value, "Unknown"),'area':poly.area*(scale_factor ** 2),'geometry': poly} for poly in polygons])        
+    if len(features)>0:
+        gdf = gpd.GeoDataFrame(features).set_geometry('geometry')        
+        gdf.geometry = gdf.scale(xfact=scale_factor, yfact=scale_factor, origin=(0,0))
+        geojson = json.loads(gdf.to_json()) # this is a bit silly, but not sure how else to add metadata
+        geojson['metadata'] = dict(class_mapping=CLASS_MAPPING, scale_factor=scale_factor)         
 
-        # Find contours
-        contours, _ = cv2.findContours(class_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Convert contours to GeoJSON features
-        for contour in contours:
-            # Flatten contour and reshape
-            contour_points = contour.reshape(-1, 2)
-
-            # Scale coordinates
-            scaled_points = contour_points * scale_factor
-
-            # Skip contours with less than 4 points
-            if len(scaled_points) < 4:
-                # print(f"Skipping contour with {len(scaled_points)} points for class {class_value}")
-                continue
-
-            # Ensure polygon is closed by adding first point at the end if needed
-            polygon_points = scaled_points.tolist()
-            if not np.array_equal(polygon_points[0], polygon_points[-1]):
-                polygon_points.append(polygon_points[0])
-
-            # Create feature for this polygon
-            feature = {
-                "type": "Feature",
-                "properties": {
-                    "class_id": int(class_value),
-                    "classification": CLASS_MAPPING.get(class_value, "Unknown"),
-                    "area": cv2.contourArea(contour) * (scale_factor ** 2)
-                },
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [polygon_points]
-                }
-            }
-
-            features.append(feature)
-
-    # Create GeoJSON structure
-    geojson = {
-        "type": "FeatureCollection",
-        "features": features,
-        "metadata": {
-            "class_mapping": CLASS_MAPPING,
-            "scale_factor": scale_factor
-        }
-    }
-
+    else:
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [],
+            "metadata": {"class_mapping": CLASS_MAPPING, "scale_factor": scale_factor}
+        }    
     # Write to file
     with open(output_path, 'w') as f:
         json.dump(geojson, f, indent=2)
-
-
